@@ -1,0 +1,44 @@
+import subprocess
+import shlex
+
+
+blocked_commands = [
+    "format",
+    "del",
+    "rm",
+    "shutdown",
+    "reg delete",
+    "powershell -command Remove-Item"
+    "os.remove"
+]
+
+def is_blocked(command):
+   
+    cmd_lower = command.lower()
+    for blocked in blocked_commands:
+        if blocked in cmd_lower:
+            return True
+    return False
+
+def safe_run(command):
+    
+    if is_blocked(command):
+        print(f"[VIRUS] Cette commande est bloquée, tu nous auras pas : {command}")
+        return
+
+    try:
+        result = subprocess.run(
+            shlex.split(command),
+            capture_output=True,
+            text=True
+        )
+        print(result.stdout)
+    except Exception as e:
+        print(f"Erreur lors de l'exécution : {e}")
+
+if __name__ == "__main__":
+    while True:
+        cmd = input("Commande > ")
+        if cmd.lower() in ["exit", "quit"]:
+            break
+        safe_run(cmd)
