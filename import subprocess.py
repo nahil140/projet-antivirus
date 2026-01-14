@@ -10,6 +10,22 @@ blocked_commands = [
     "reg delete",
     "powershell -command Remove-Item"
     "os.remove"
+    "os.unlink"
+    "os.rmdir"
+    "shutil.rmtree"
+    "pathlib.Path.unlink"
+    "Path.rmdir"
+    "os.system"
+    "subprocess.run"
+    "subprocess.call"
+    "subprocess.Popen"
+    "commands"
+    "eval"
+    "exec"
+    "compile"
+    "pickle.load"
+    "pickle.loads"
+    "marshal.load"
 ]
 
 def is_blocked(command):
