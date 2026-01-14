@@ -26,6 +26,12 @@ blocked_commands = [
     "pickle.load"
     "pickle.loads"
     "marshal.load"
+    "eval"
+    "exec"
+    "assert"
+    "yaml.load"
+    "mktemp"
+    "random"
 ]
 
 def is_blocked(command):
