@@ -1,59 +1,94 @@
 from pathlib import Path
+from datetime import datetime
 import hashlib
 import json
-import shutil
-from datetime import datetime
 import os
-import sys
+import shutil
+import struct
+import time
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# Dossier où se trouve le programme
 BASE_DIR = Path(__file__).resolve().parent
 
-# Dossiers/fichiers du programme
 QUARANTINE_DIR = BASE_DIR / "quarantine"
 LOG_FILE = BASE_DIR / "antivirus.log"
 REPORT_FILE = BASE_DIR / "scan_report.json"
 
-# Extensions considérées comme potentiellement suspectes
-SUSPICIOUS_EXTENSIONS = {
+# Fichiers de signatures SHA-256.
+# Ajoute ici les SHA-256 de fichiers malveillants connus.
+KNOWN_MALWARE_HASHES = {
+    # "sha256_du_malware": "NomDuMalware",
+}
+
+# Motifs simples recherchés dans les fichiers.
+# Ils ne constituent PAS à eux seuls une preuve de malware.
+SUSPICIOUS_STRINGS = [
+    b"powershell -enc",
+    b"powershell.exe -enc",
+    b"cmd.exe /c",
+    b"rundll32.exe",
+    b"regsvr32.exe",
+    b"mshta.exe",
+    b"certutil.exe -decode",
+    b"bitsadmin.exe",
+    b"wscript.exe",
+    b"cscript.exe",
+    b"CreateRemoteThread",
+    b"VirtualAlloc",
+    b"WriteProcessMemory",
+    b"WinExec",
+    b"ShellExecute",
+    b"URLDownloadToFile",
+]
+
+# Extensions exécutables utilisées uniquement pour
+# orienter l'analyse heuristique.
+EXECUTABLE_EXTENSIONS = {
     ".exe",
     ".dll",
-    ".bat",
-    ".cmd",
     ".scr",
-    ".vbs",
-    ".js",
-    ".ps1",
-    ".msi",
-    ".com",
-    ".hta",
-    ".jar",
+    ".sys",
+    ".ocx",
+    ".cpl",
 }
 
-# Dossiers Windows qu'on peut ignorer pour éviter
-# certains scans inutiles ou problématiques
-IGNORED_DIRECTORIES = {
-    "$recycle.bin",
-    "system volume information",
-}
+# Taille maximale lue pour la recherche de chaînes.
+# Le fichier complet est toujours utilisé pour SHA-256.
+MAX_CONTENT_SCAN = 50 * 1024 * 1024
+
+# Score à partir duquel le fichier est considéré
+# comme fortement suspect.
+QUARANTINE_SCORE = 80
+
 
 # ============================================================
-# JOURNALISATION
+# OUTILS
 # ============================================================
+
+def separator():
+    print("=" * 75)
+
 
 def log(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
     line = f"[{timestamp}] {message}"
 
     print(line)
 
     try:
-        with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        with LOG_FILE.open(
+            "a",
+            encoding="utf-8"
+        ) as file:
+            file.write(line + "\n")
+
     except OSError:
         pass
 
@@ -62,20 +97,290 @@ def log(message):
 # SHA-256
 # ============================================================
 
-def sha256_file(path):
-    path = Path(path)
+def calculate_sha256(path):
+    """
+    Calcule le SHA-256 complet du fichier.
+    """
+
     sha256 = hashlib.sha256()
 
     try:
-        with path.open("rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+
+        with path.open("rb") as file:
+
+            while True:
+
+                chunk = file.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
                 sha256.update(chunk)
 
         return sha256.hexdigest()
 
-    except (OSError, PermissionError) as e:
-        log(f"Impossible de lire {path}: {e}")
+    except (OSError, PermissionError) as error:
+
+        log(
+            f"Impossible de calculer SHA-256 "
+            f"pour {path}: {error}"
+        )
+
         return None
+
+
+# ============================================================
+# LECTURE PARTIELLE DU CONTENU
+# ============================================================
+
+def read_content(path):
+    """
+    Lit une partie du fichier pour l'analyse heuristique.
+    """
+
+    try:
+
+        size = path.stat().st_size
+
+        amount = min(
+            size,
+            MAX_CONTENT_SCAN
+        )
+
+        with path.open("rb") as file:
+
+            return file.read(amount)
+
+    except (OSError, PermissionError) as error:
+
+        log(
+            f"Impossible de lire {path}: {error}"
+        )
+
+        return b""
+
+
+# ============================================================
+# DÉTECTION PE WINDOWS
+# ============================================================
+
+def is_pe_file(path):
+    """
+    Vérifie si le fichier possède une structure PE Windows.
+
+    Un fichier PE commence généralement par:
+    MZ
+
+    Puis l'en-tête PE est référencé depuis le header DOS.
+    """
+
+    try:
+
+        with path.open("rb") as file:
+
+            dos_header = file.read(64)
+
+            if len(dos_header) < 64:
+                return False
+
+            if dos_header[:2] != b"MZ":
+                return False
+
+            pe_offset = struct.unpack_from(
+                "<I",
+                dos_header,
+                60
+            )[0]
+
+            if pe_offset > 10 * 1024 * 1024:
+                return False
+
+            file.seek(pe_offset)
+
+            signature = file.read(4)
+
+            return signature == b"PE\x00\x00"
+
+    except (OSError, PermissionError, struct.error):
+
+        return False
+
+
+# ============================================================
+# ANALYSE DES CHAÎNES
+# ============================================================
+
+def find_suspicious_strings(content):
+    """
+    Recherche des chaînes potentiellement suspectes.
+    """
+
+    findings = []
+
+    lower_content = content.lower()
+
+    for pattern in SUSPICIOUS_STRINGS:
+
+        if pattern.lower() in lower_content:
+
+            try:
+                name = pattern.decode(
+                    "ascii",
+                    errors="replace"
+                )
+
+            except Exception:
+
+                name = repr(pattern)
+
+            findings.append(name)
+
+    return findings
+
+
+# ============================================================
+# ENTROPie
+# ============================================================
+
+def calculate_entropy(data):
+    """
+    Calcule une estimation de l'entropie.
+
+    Une entropie élevée peut être observée dans des
+    données compressées ou chiffrées, mais n'indique
+    PAS automatiquement un malware.
+    """
+
+    if not data:
+        return 0.0
+
+    counts = [0] * 256
+
+    for byte in data:
+        counts[byte] += 1
+
+    length = len(data)
+
+    entropy = 0.0
+
+    import math
+
+    for count in counts:
+
+        if count == 0:
+            continue
+
+        probability = count / length
+
+        entropy -= (
+            probability
+            * math.log2(probability)
+        )
+
+    return entropy
+
+
+# ============================================================
+# ANALYSE HEURISTIQUE
+# ============================================================
+
+def heuristic_analysis(path, content):
+    """
+    Retourne un score et les raisons de ce score.
+    """
+
+    score = 0
+
+    reasons = []
+
+    extension = path.suffix.lower()
+
+    # --------------------------------------------------------
+    # PE
+    # --------------------------------------------------------
+
+    pe = is_pe_file(path)
+
+    if pe:
+
+        score += 5
+
+        reasons.append(
+            "Fichier PE Windows détecté"
+        )
+
+    # --------------------------------------------------------
+    # STRINGS SUSPECTES
+    # --------------------------------------------------------
+
+    strings = find_suspicious_strings(
+        content
+    )
+
+    if strings:
+
+        score += min(
+            len(strings) * 15,
+            60
+        )
+
+        reasons.append(
+            "Chaînes potentiellement suspectes : "
+            + ", ".join(strings[:5])
+        )
+
+    # --------------------------------------------------------
+    # ENTROPIE
+    # --------------------------------------------------------
+
+    entropy = calculate_entropy(
+        content[:1024 * 1024]
+    )
+
+    if entropy >= 7.5:
+
+        score += 15
+
+        reasons.append(
+            f"Entropie élevée ({entropy:.2f})"
+        )
+
+    # --------------------------------------------------------
+    # EXTENSION EXÉCUTABLE
+    # --------------------------------------------------------
+
+    if extension in EXECUTABLE_EXTENSIONS:
+
+        if pe:
+
+            score += 5
+
+            reasons.append(
+                "Fichier exécutable Windows"
+            )
+
+    # --------------------------------------------------------
+    # FICHIER TRÈS PETIT MAIS EXÉCUTABLE
+    # --------------------------------------------------------
+
+    try:
+
+        size = path.stat().st_size
+
+        if pe and size < 10 * 1024:
+
+            score += 10
+
+            reasons.append(
+                "Exécutable PE inhabituellement petit"
+            )
+
+    except OSError:
+        pass
+
+    return score, reasons, entropy
 
 
 # ============================================================
@@ -83,71 +388,184 @@ def sha256_file(path):
 # ============================================================
 
 def scan_file(path):
+
     path = Path(path)
 
     if not path.is_file():
         return None
 
     try:
-        extension = path.suffix.lower()
-        file_hash = sha256_file(path)
+        path = path.resolve()
+    except OSError:
+        pass
 
-        if file_hash is None:
-            return None
+    print()
+    print(
+        f"Analyse : {path}"
+    )
 
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
+    # --------------------------------------------------------
+    # TAILLE
+    # --------------------------------------------------------
 
-        suspicious = extension in SUSPICIOUS_EXTENSIONS
+    try:
 
-        result = {
-            "path": str(path.resolve()),
-            "name": path.name,
-            "extension": extension,
-            "size": size,
-            "sha256": file_hash,
-            "suspicious": suspicious,
-            "scan_time": datetime.now().isoformat()
-        }
+        size = path.stat().st_size
 
-        if suspicious:
-            log(
-                f"[SUSPECT] {path} "
-                f"(extension : {extension})"
-            )
+    except OSError:
 
-        return result
-
-    except (OSError, PermissionError) as e:
-        log(f"Erreur avec {path}: {e}")
         return None
+
+    # --------------------------------------------------------
+    # SHA-256
+    # --------------------------------------------------------
+
+    file_hash = calculate_sha256(path)
+
+    if file_hash is None:
+        return None
+
+    # --------------------------------------------------------
+    # SIGNATURE SHA-256
+    # --------------------------------------------------------
+
+    known_malware = (
+        file_hash.lower()
+        in {
+            value.lower()
+            for value in KNOWN_MALWARE_HASHES
+        }
+    )
+
+    malware_name = None
+
+    if known_malware:
+
+        malware_name = (
+            KNOWN_MALWARE_HASHES[
+                file_hash
+            ]
+        )
+
+    # --------------------------------------------------------
+    # CONTENU
+    # --------------------------------------------------------
+
+    content = read_content(path)
+
+    # --------------------------------------------------------
+    # HEURISTIQUE
+    # --------------------------------------------------------
+
+    score, reasons, entropy = (
+        heuristic_analysis(
+            path,
+            content
+        )
+    )
+
+    # --------------------------------------------------------
+    # SIGNATURE CONNUE
+    # --------------------------------------------------------
+
+    if known_malware:
+
+        score = 100
+
+        reasons.insert(
+            0,
+            f"Signature connue : {malware_name}"
+        )
+
+    # --------------------------------------------------------
+    # NIVEAU
+    # --------------------------------------------------------
+
+    if known_malware:
+
+        status = "MALWARE_CONFIRME"
+
+    elif score >= QUARANTINE_SCORE:
+
+        status = "TRES_SUSPECT"
+
+    elif score >= 40:
+
+        status = "SUSPECT"
+
+    else:
+
+        status = "NORMAL"
+
+    result = {
+        "path": str(path),
+        "name": path.name,
+        "extension": path.suffix.lower(),
+        "size": size,
+        "sha256": file_hash,
+        "pe_file": is_pe_file(path),
+        "entropy": round(entropy, 3),
+        "score": score,
+        "status": status,
+        "malware_name": malware_name,
+        "reasons": reasons,
+        "scan_time": datetime.now().isoformat(),
+    }
+
+    # --------------------------------------------------------
+    # AFFICHAGE
+    # --------------------------------------------------------
+
+    if status == "MALWARE_CONFIRME":
+
+        log(
+            f"[MALWARE] {path} "
+            f"-> {malware_name}"
+        )
+
+    elif status == "TRES_SUSPECT":
+
+        log(
+            f"[ALERTE] {path} "
+            f"(score {score})"
+        )
+
+    elif status == "SUSPECT":
+
+        log(
+            f"[SUSPECT] {path} "
+            f"(score {score})"
+        )
+
+    else:
+
+        print(
+            f"  -> Normal "
+            f"(score {score})"
+        )
+
+    return result
 
 
 # ============================================================
-# VÉRIFIER SI UN DOSSIER DOIT ÊTRE IGNORÉ
+# DOSSIERS IGNORÉS
 # ============================================================
 
 def should_ignore_directory(path):
+
     try:
-        name = path.name.lower()
 
-        if name in IGNORED_DIRECTORIES:
-            return True
-
-        # Ne jamais scanner notre propre quarantaine
-        quarantine = QUARANTINE_DIR.resolve()
-
-        try:
-            path.resolve().relative_to(quarantine)
-            return True
-        except ValueError:
-            pass
-
-        return False
+        return (
+            path.name.lower()
+            in {
+                "$recycle.bin",
+                "system volume information",
+                "quarantine",
+            }
+        )
 
     except OSError:
+
         return False
 
 
@@ -156,78 +574,96 @@ def should_ignore_directory(path):
 # ============================================================
 
 def scan_directory(directory):
+
     directory = Path(directory)
 
-    if not directory.exists():
-        log(f"Dossier introuvable : {directory}")
-        return []
-
-    if not directory.is_dir():
-        log(f"Ce chemin n'est pas un dossier : {directory}")
-        return []
-
     results = []
-
-    print()
-    print("=" * 70)
-    print("SCAN DU DOSSIER")
-    print("=" * 70)
-    print(f"Dossier : {directory}")
-    print()
 
     scanned = 0
     errors = 0
 
+    separator()
+
+    print("SCAN DU DOSSIER")
+
+    separator()
+
+    print()
+    print(
+        f"Dossier : {directory}"
+    )
+
+    print()
+
+    def on_error(error):
+
+        nonlocal errors
+
+        errors += 1
+
+        log(
+            f"Erreur d'accès : {error}"
+        )
+
     try:
-        for root, dirs, files in os.walk(
+
+        for root, directories, files in os.walk(
             directory,
             topdown=True,
-            onerror=lambda error: log(
-                f"Accès refusé : {error}"
-            )
+            onerror=on_error
         ):
 
             root_path = Path(root)
 
-            # Supprimer de la recherche les dossiers interdits
-            dirs[:] = [
-                d for d in dirs
+            directories[:] = [
+                name
+                for name in directories
                 if not should_ignore_directory(
-                    root_path / d
+                    root_path / name
                 )
             ]
 
             for filename in files:
 
-                file_path = root_path / filename
+                file_path = (
+                    root_path / filename
+                )
 
-                result = scan_file(file_path)
+                result = scan_file(
+                    file_path
+                )
 
                 if result:
+
                     results.append(result)
+
                     scanned += 1
 
                     print(
-                        f"\rFichiers analysés : {scanned}",
+                        f"\rFichiers analysés : "
+                        f"{scanned}",
                         end="",
                         flush=True
                     )
+
                 else:
+
                     errors += 1
 
-    except PermissionError as e:
-        print()
-        log(f"Accès refusé : {e}")
+    except KeyboardInterrupt:
 
-    except OSError as e:
         print()
-        log(f"Erreur pendant le scan : {e}")
+
+        log(
+            "Scan interrompu."
+        )
 
     print()
     print()
 
     log(
-        f"Scan terminé : {scanned} fichier(s), "
+        f"Scan terminé : "
+        f"{scanned} fichier(s), "
         f"{errors} erreur(s)"
     )
 
@@ -235,173 +671,251 @@ def scan_directory(directory):
 
 
 # ============================================================
-# SCANNER FICHIER OU DOSSIER
+# SCAN D'UN CHEMIN
 # ============================================================
 
 def scan_path(path):
+
     path = str(path).strip().strip('"')
 
     if not path:
         return []
 
-    path = Path(path).expanduser()
+    target = Path(path).expanduser()
 
     try:
-        path = path.resolve()
+        target = target.resolve()
     except OSError:
         pass
 
-    print()
-    print(f"Chemin utilisé : {path}")
-
-    if not path.exists():
+    if not target.exists():
 
         print()
-        print("ERREUR : ce chemin n'existe pas.")
-        print()
+        print(
+            "ERREUR : le chemin n'existe pas."
+        )
 
         return []
 
-    if path.is_file():
+    if target.is_file():
 
-        result = scan_file(path)
+        result = scan_file(target)
 
-        if result:
-            return [result]
+        return [result] if result else []
 
-        return []
+    if target.is_dir():
 
-    if path.is_dir():
-        return scan_directory(path)
-
-    print("Ce chemin n'est ni un fichier ni un dossier.")
+        return scan_directory(
+            target
+        )
 
     return []
 
 
 # ============================================================
-# SÉLECTION WINDOWS
+# RAPPORT
 # ============================================================
 
-def select_file_or_folder():
-    """
-    Ouvre une interface Windows permettant de choisir
-    un fichier ou un dossier.
-    """
+def save_report(results):
+
+    malware = [
+        result
+        for result in results
+        if result["status"]
+        == "MALWARE_CONFIRME"
+    ]
+
+    very_suspicious = [
+        result
+        for result in results
+        if result["status"]
+        == "TRES_SUSPECT"
+    ]
+
+    suspicious = [
+        result
+        for result in results
+        if result["status"]
+        == "SUSPECT"
+    ]
+
+    report = {
+        "scanner": "Python Autonomous Antivirus",
+        "scan_time": datetime.now().isoformat(),
+        "files_scanned": len(results),
+        "confirmed_malware": len(malware),
+        "very_suspicious": len(very_suspicious),
+        "suspicious": len(suspicious),
+        "results": results,
+    }
 
     try:
-        import tkinter as tk
-        from tkinter import filedialog
 
-    except ImportError:
+        with REPORT_FILE.open(
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                report,
+                file,
+                indent=4,
+                ensure_ascii=False
+            )
+
+        print()
         print(
-            "Tkinter n'est pas disponible sur cette installation Python."
+            f"Rapport : {REPORT_FILE}"
         )
-        return None
 
-    root = tk.Tk()
-    root.withdraw()
+    except OSError as error:
 
-    print()
-    print("Sélectionnez un fichier ou un dossier...")
-    print()
-
-    # Choix du dossier
-    folder = filedialog.askdirectory(
-        title="Sélectionner un dossier à scanner"
-    )
-
-    if folder:
-        root.destroy()
-        return folder
-
-    # Si aucun dossier n'est sélectionné,
-    # proposer un fichier
-    file = filedialog.askopenfilename(
-        title="Sélectionner un fichier à scanner"
-    )
-
-    root.destroy()
-
-    if file:
-        return file
-
-    return None
+        log(
+            f"Erreur rapport : {error}"
+        )
 
 
 # ============================================================
-# DOSSIERS COURANTS
+# AFFICHAGE FINAL
 # ============================================================
 
-def show_common_paths():
+def display_results(results):
 
-    home = Path.home()
+    malware = [
+        r for r in results
+        if r["status"]
+        == "MALWARE_CONFIRME"
+    ]
+
+    very_suspicious = [
+        r for r in results
+        if r["status"]
+        == "TRES_SUSPECT"
+    ]
+
+    suspicious = [
+        r for r in results
+        if r["status"]
+        == "SUSPECT"
+    ]
+
+    separator()
+
+    print("RÉSULTAT")
+
+    separator()
 
     print()
-    print("=" * 70)
-    print("DOSSIERS DISPONIBLES")
-    print("=" * 70)
 
-    print()
-    print(f"[1] Dossier utilisateur")
-    print(f"    {home}")
+    print(
+        f"Fichiers analysés : "
+        f"{len(results)}"
+    )
 
-    desktop = home / "Desktop"
+    print(
+        f"Malwares confirmés : "
+        f"{len(malware)}"
+    )
 
-    if desktop.exists():
+    print(
+        f"Très suspects : "
+        f"{len(very_suspicious)}"
+    )
+
+    print(
+        f"Suspects : "
+        f"{len(suspicious)}"
+    )
+
+    # --------------------------------------------------------
+    # MALWARE
+    # --------------------------------------------------------
+
+    if malware:
+
         print()
-        print("[2] Bureau")
-        print(f"    {desktop}")
+        print(
+            "!!! MALWARES DÉTECTÉS !!!"
+        )
 
-    downloads = home / "Downloads"
-
-    if downloads.exists():
-        print()
-        print("[3] Téléchargements")
-        print(f"    {downloads}")
-
-    documents = home / "Documents"
-
-    if documents.exists():
-        print()
-        print("[4] Documents")
-        print(f"    {documents}")
-
-    pictures = home / "Pictures"
-
-    if pictures.exists():
-        print()
-        print("[5] Images")
-        print(f"    {pictures}")
-
-    videos = home / "Videos"
-
-    if videos.exists():
-        print()
-        print("[6] Vidéos")
-        print(f"    {videos}")
-
-    if os.name == "nt":
-
-        users_folder = Path("C:/Users")
-
-        if users_folder.exists():
+        for result in malware:
 
             print()
-            print("[7] Utilisateurs Windows")
+            print(
+                f"Fichier : {result['path']}"
+            )
 
-            try:
+            print(
+                f"Nom : {result['malware_name']}"
+            )
 
-                for folder in users_folder.iterdir():
+            print(
+                f"SHA-256 : {result['sha256']}"
+            )
 
-                    if folder.is_dir():
-                        print(f"    {folder}")
+    # --------------------------------------------------------
+    # TRÈS SUSPECT
+    # --------------------------------------------------------
 
-            except PermissionError:
-                print("    Accès refusé.")
+    if very_suspicious:
 
-    print()
-    print("=" * 70)
+        print()
+        print(
+            "FICHIERS TRÈS SUSPECTS"
+        )
+
+        for result in very_suspicious:
+
+            print()
+            print(
+                f"Fichier : {result['path']}"
+            )
+
+            print(
+                f"Score : {result['score']}"
+            )
+
+            for reason in result["reasons"]:
+
+                print(
+                    f"  - {reason}"
+                )
+
+    # --------------------------------------------------------
+    # SUSPECT
+    # --------------------------------------------------------
+
+    if suspicious:
+
+        print()
+        print(
+            "FICHIERS SUSPECTS"
+        )
+
+        for result in suspicious:
+
+            print()
+            print(
+                f"Fichier : {result['path']}"
+            )
+
+            print(
+                f"Score : {result['score']}"
+            )
+
+            for reason in result["reasons"]:
+
+                print(
+                    f"  - {reason}"
+                )
+
+    if not malware and not very_suspicious:
+
+        print()
+        print(
+            "Aucun malware connu ou fichier "
+            "fortement suspect détecté."
+        )
 
 
 # ============================================================
@@ -414,54 +928,36 @@ def quarantine_file(path):
 
     if not path.is_file():
 
-        log(
-            f"Fichier introuvable : {path}"
-        )
-
         return False
 
     try:
-        path = path.resolve()
-    except OSError:
-        pass
 
-    # Ne jamais mettre un fichier déjà dans la quarantaine
-    try:
-        path.relative_to(
-            QUARANTINE_DIR.resolve()
-        )
-
-        log(
-            f"Fichier déjà en quarantaine : {path}"
-        )
-
-        return False
-
-    except ValueError:
-        pass
-
-    try:
         QUARANTINE_DIR.mkdir(
             parents=True,
             exist_ok=True
         )
-    except OSError as e:
+
+    except OSError as error:
 
         log(
-            f"Impossible de créer la quarantaine : {e}"
+            f"Impossible de créer la quarantaine : "
+            f"{error}"
         )
 
         return False
 
-    destination = QUARANTINE_DIR / path.name
+    destination = (
+        QUARANTINE_DIR / path.name
+    )
 
     counter = 1
 
     while destination.exists():
 
         destination = (
-            QUARANTINE_DIR /
-            f"{path.stem}_{counter}{path.suffix}"
+            QUARANTINE_DIR
+            / f"{path.stem}_{counter}"
+            f"{path.suffix}"
         )
 
         counter += 1
@@ -480,283 +976,240 @@ def quarantine_file(path):
 
         return True
 
-    except (OSError, PermissionError) as e:
+    except (OSError, PermissionError) as error:
 
         log(
-            f"Erreur de quarantaine : {e}"
+            f"Erreur quarantaine : {error}"
         )
 
         return False
 
 
 # ============================================================
-# QUARANTAINE DES FICHIERS SUSPECTS
+# BLOQUER / ISOLER LES MENACES
 # ============================================================
 
-def quarantine_suspicious_files(results):
+def quarantine_threats(results):
 
-    suspicious = [
+    threats = [
         result
         for result in results
-        if result["suspicious"]
+        if result["status"]
+        in {
+            "MALWARE_CONFIRME",
+            "TRES_SUSPECT",
+        }
     ]
 
-    if not suspicious:
-
-        print()
-        print("Aucun fichier suspect.")
+    if not threats:
 
         return
 
     print()
-    print("=" * 70)
-    print("FICHIERS POTENTIELLEMENT SUSPECTS")
-    print("=" * 70)
+    separator()
 
-    for index, result in enumerate(
-        suspicious,
+    print("MENACES À ISOLER")
+
+    separator()
+
+    print()
+
+    for number, result in enumerate(
+        threats,
         start=1
     ):
 
-        print()
-        print(f"[{index}] {result['path']}")
         print(
-            f"    Extension : "
-            f"{result['extension']}"
+            f"[{number}] {result['path']}"
         )
+
         print(
-            f"    Taille    : "
-            f"{result['size']} octets"
+            f"    Score : {result['score']}"
         )
+
         print(
-            f"    SHA-256   : "
-            f"{result['sha256']}"
+            f"    État : {result['status']}"
         )
 
     print()
 
-    choice = input(
-        "Mettre TOUS ces fichiers en quarantaine ? (o/n) > "
+    answer = input(
+        "Isoler ces fichiers ? (o/n) : "
     ).strip().lower()
 
-    if choice not in (
+    if answer not in (
         "o",
         "oui",
         "y",
         "yes"
     ):
 
-        print()
-        print("Aucun fichier déplacé.")
+        print(
+            "Aucun fichier isolé."
+        )
 
         return
 
     success = 0
     failed = 0
 
-    for result in suspicious:
+    for result in threats:
 
         if quarantine_file(
             result["path"]
         ):
+
             success += 1
+
         else:
+
             failed += 1
 
     print()
+
     print(
-        f"Quarantaine terminée : "
-        f"{success} déplacé(s), "
+        f"Isolation terminée : "
+        f"{success} succès, "
         f"{failed} échec(s)."
     )
 
 
 # ============================================================
-# RAPPORT JSON
+# SCAN MANUEL
 # ============================================================
 
-def save_report(results):
-
-    suspicious_count = sum(
-        1
-        for result in results
-        if result["suspicious"]
-    )
-
-    report = {
-        "scan_time": datetime.now().isoformat(),
-        "scanner": "Antivirus Local Python",
-        "base_directory": str(BASE_DIR),
-        "files_scanned": len(results),
-        "suspicious_files": suspicious_count,
-        "results": results
-    }
-
-    try:
-
-        with REPORT_FILE.open(
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                report,
-                f,
-                indent=4,
-                ensure_ascii=False
-            )
-
-        log(
-            f"Rapport sauvegardé : "
-            f"{REPORT_FILE.resolve()}"
-        )
-
-    except OSError as e:
-
-        log(
-            f"Impossible de sauvegarder "
-            f"le rapport : {e}"
-        )
-
-
-# ============================================================
-# AFFICHAGE DES RÉSULTATS
-# ============================================================
-
-def display_results(results):
+def manual_scan():
 
     print()
-    print("=" * 70)
-    print("RÉSULTAT DU SCAN")
-    print("=" * 70)
+    separator()
+
+    print("SCAN")
+
+    separator()
+
+    print()
+
+    print(
+        "Entrez le chemin du fichier "
+        "ou du dossier."
+    )
 
     print()
     print(
-        f"Fichiers analysés : "
-        f"{len(results)}"
+        r"Exemple : C:\Users\VotreNom\Downloads"
     )
 
-    suspicious = [
-        result
-        for result in results
-        if result["suspicious"]
+    print()
+
+    path = input(
+        "Chemin : "
+    ).strip()
+
+    if not path:
+
+        print(
+            "Aucun chemin."
+        )
+
+        return
+
+    results = scan_path(path)
+
+    if not results:
+
+        print(
+            "Aucun fichier analysé."
+        )
+
+        return
+
+    display_results(results)
+
+    save_report(results)
+
+    quarantine_threats(results)
+
+
+# ============================================================
+# TEST D'UN FICHIER
+# ============================================================
+
+def test_single_file():
+
+    print()
+    separator()
+
+    print("ANALYSER UN FICHIER")
+
+    separator()
+
+    print()
+
+    path = input(
+        "Fichier : "
+    ).strip().strip('"')
+
+    if not path:
+
+        return
+
+    result = scan_file(
+        Path(path)
+    )
+
+    if not result:
+
+        print(
+            "Impossible d'analyser le fichier."
+        )
+
+        return
+
+    display_results(
+        [result]
+    )
+
+    save_report(
+        [result]
+    )
+
+    quarantine_threats(
+        [result]
+    )
+
+
+# ============================================================
+# SCAN D'UN DOSSIER COURANT
+# ============================================================
+
+def show_common_paths():
+
+    home = Path.home()
+
+    separator()
+
+    print("DOSSIERS COURANTS")
+
+    separator()
+
+    print()
+
+    paths = [
+        ("Utilisateur", home),
+        ("Bureau", home / "Desktop"),
+        ("Téléchargements", home / "Downloads"),
+        ("Documents", home / "Documents"),
+        ("Images", home / "Pictures"),
+        ("Vidéos", home / "Videos"),
     ]
 
-    print(
-        f"Fichiers potentiellement suspects : "
-        f"{len(suspicious)}"
-    )
+    for name, path in paths:
 
-    if suspicious:
-
-        print()
-        print("Fichiers suspects :")
-
-        for result in suspicious:
-
-            print()
-            print(
-                f"- {result['path']}"
-            )
+        if path.exists():
 
             print(
-                f"  Extension : "
-                f"{result['extension']}"
+                f"{name} : {path}"
             )
-
-            print(
-                f"  Taille : "
-                f"{result['size']} octets"
-            )
-
-            print(
-                f"  SHA-256 : "
-                f"{result['sha256']}"
-            )
-
-    else:
-
-        print()
-        print(
-            "Aucun fichier correspondant "
-            "aux extensions suspectes."
-        )
-
-    print()
-
-
-# ============================================================
-# SHA-256 MANUEL
-# ============================================================
-
-def manual_sha256():
-
-    filename = input(
-        "\nFichier > "
-    ).strip().strip('"')
-
-    path = Path(
-        filename
-    ).expanduser()
-
-    if not path.is_file():
-
-        print(
-            "Fichier introuvable."
-        )
-
-        return
-
-    file_hash = sha256_file(path)
-
-    if file_hash:
-
-        print()
-        print("SHA-256 :")
-        print(file_hash)
-
-
-# ============================================================
-# QUARANTAINE MANUELLE
-# ============================================================
-
-def manual_quarantine():
-
-    filename = input(
-        "\nFichier à isoler > "
-    ).strip().strip('"')
-
-    path = Path(
-        filename
-    ).expanduser()
-
-    if not path.is_file():
-
-        print(
-            "Fichier introuvable."
-        )
-
-        return
-
-    confirmation = input(
-        f"\nMettre '{path}' "
-        "en quarantaine ? (o/n) > "
-    ).strip().lower()
-
-    if confirmation in (
-        "o",
-        "oui",
-        "y",
-        "yes"
-    ):
-
-        quarantine_file(path)
-
-    else:
-
-        print(
-            "Opération annulée."
-        )
 
 
 # ============================================================
@@ -765,148 +1218,80 @@ def manual_quarantine():
 
 def main():
 
-    print("=" * 80)
+    print()
+
+    separator()
+
     print(
-        "             ANTIVIRUS LOCAL PYTHON"
+        "ANTIVIRUS PYTHON AUTONOME"
     )
-    print(
-        "          Scanner de fichiers Windows"
-    )
-    print("=" * 80)
+
+    separator()
 
     print()
-    print(f"Programme : {BASE_DIR}")
-    print(f"Quarantaine : {QUARANTINE_DIR}")
-    print(f"Rapport : {REPORT_FILE}")
+
+    print(
+        "Analyse de contenu + signatures "
+        "+ heuristiques"
+    )
+
     print()
+
+    print(
+        f"Quarantaine : {QUARANTINE_DIR}"
+    )
 
     while True:
 
         print()
-        print("=" * 60)
+
+        separator()
+
         print("MENU")
-        print("=" * 60)
+
+        separator()
 
         print()
-        print("1. Sélectionner un fichier/dossier")
-        print("2. Entrer manuellement un chemin")
-        print("3. Calculer le SHA-256")
-        print("4. Mettre un fichier en quarantaine")
-        print("5. Afficher les dossiers disponibles")
-        print("6. Quitter")
+
+        print(
+            "1. Scanner un fichier ou un dossier"
+        )
+
+        print(
+            "2. Analyser un seul fichier"
+        )
+
+        print(
+            "3. Afficher les dossiers courants"
+        )
+
+        print(
+            "4. Quitter"
+        )
+
+        print()
 
         choice = input(
-            "\nChoix > "
+            "Choix : "
         ).strip()
-
-        # ====================================================
-        # SÉLECTION WINDOWS
-        # ====================================================
 
         if choice == "1":
 
-            target = select_file_or_folder()
-
-            if not target:
-
-                print()
-                print(
-                    "Aucune sélection."
-                )
-
-                continue
-
-            results = scan_path(target)
-
-            display_results(results)
-
-            if results:
-
-                save_report(results)
-
-                suspicious = [
-                    result
-                    for result in results
-                    if result["suspicious"]
-                ]
-
-                if suspicious:
-
-                    quarantine_suspicious_files(
-                        results
-                    )
-
-        # ====================================================
-        # CHEMIN MANUEL
-        # ====================================================
+            manual_scan()
 
         elif choice == "2":
 
-            target = input(
-                "\nFichier ou dossier à scanner > "
-            ).strip()
-
-            if not target:
-
-                print(
-                    "Aucun chemin fourni."
-                )
-
-                continue
-
-            results = scan_path(target)
-
-            display_results(results)
-
-            if results:
-
-                save_report(results)
-
-                suspicious = [
-                    result
-                    for result in results
-                    if result["suspicious"]
-                ]
-
-                if suspicious:
-
-                    quarantine_suspicious_files(
-                        results
-                    )
-
-        # ====================================================
-        # SHA-256
-        # ====================================================
+            test_single_file()
 
         elif choice == "3":
 
-            manual_sha256()
-
-        # ====================================================
-        # QUARANTAINE
-        # ====================================================
+            show_common_paths()
 
         elif choice == "4":
 
-            manual_quarantine()
-
-        # ====================================================
-        # CHEMINS DISPONIBLES
-        # ====================================================
-
-        elif choice == "5":
-
-            show_common_paths()
-
-        # ====================================================
-        # QUITTER
-        # ====================================================
-
-        elif choice == "6":
-
             print()
             print(
-                "Fermeture de l'antivirus."
+                "Fermeture."
             )
 
             break
@@ -926,6 +1311,7 @@ def main():
 if __name__ == "__main__":
 
     try:
+
         main()
 
     except KeyboardInterrupt:
@@ -933,13 +1319,26 @@ if __name__ == "__main__":
         print()
         print()
         print(
-            "Programme interrompu."
+            "Scan interrompu."
         )
 
-    except Exception as e:
+    except Exception as error:
 
         print()
-        print(
-            f"Erreur inattendue : {e}"
+        separator()
+
+        print("ERREUR")
+
+        separator()
+
+        print()
+        print(error)
+        print()
+
+        log(
+            f"Erreur inattendue : {error}"
         )
 
+        input(
+            "Appuyez sur Entrée pour fermer..."
+        )
